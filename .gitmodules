@@ -1,0 +1,6 @@
+[submodule "tools/clang"]
+	path = tools/clang
+	url = ../clang.git
+[submodule "projects/compiler-rt"]
+	path = projects/compiler-rt
+	url = ../compiler-rt.git
