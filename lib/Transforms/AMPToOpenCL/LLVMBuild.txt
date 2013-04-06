@@ -1,4 +1,4 @@
-;===- ./lib/Transforms/LLVMBuild.txt ---------------------------*- Conf -*--===;
+;===- ./lib/Transforms/Scalar/LLVMBuild.txt --------------------*- Conf -*--===;
 ;
 ;                     The LLVM Compiler Infrastructure
 ;
@@ -15,10 +15,10 @@
 ;
 ;===------------------------------------------------------------------------===;
 
-[common]
-subdirectories = IPO InstCombine Instrumentation Scalar Utils Vectorize ObjCARC AMPToOpenCL
-
 [component_0]
-type = Group
-name = Transforms
-parent = Libraries
+type = Library
+name = AMPToOpenCL
+parent = Transforms
+library_name = AMPToOpenCL
+required_libraries = Analysis Core InstCombine Support Target TransformUtils
+
