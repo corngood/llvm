@@ -18,6 +18,7 @@
 #include "llvm/Analysis/Passes.h"
 #include "llvm/Analysis/Verifier.h"
 #include "llvm/InitializePasses.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Constants.h"
@@ -27,13 +28,18 @@
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Value.h"
 #include "llvm/PassManager.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/IPO.h"
 #include "llvm/Transforms/Utils/Cloning.h"
-#include "../../Target/NVPTX/MCTargetDesc/NVPTXBaseInfo.h"
 #include <set>
+#include <fstream>
 
 using namespace llvm;
+
+static cl::opt<std::string>
+KernelFile("amp-kernel-file", cl::value_desc("filename"),
+        cl::desc("A file containing the AMP kernels for this module"));
 
 namespace {
   void filterAMPFunctions(Module &M, bool const amp) {
@@ -159,24 +165,6 @@ namespace {
 
   class AMPToOpenCL : public ModulePass {
 
-    /*template<typename ListType> void findKernelArguments(Type * const T, ListType &ArgumentTypeList) {
-      if(StructType * const ST = dyn_cast<StructType>(T)) {
-        for(unsigned i = 0; i < ST->getNumContainedTypes(); ++i) {
-          findKernelArguments(ST->getContainedType(i), ArgumentTypeList);
-        }
-      } else if(ArrayType * const AT = dyn_cast<ArrayType>(T)) {
-        for(unsigned i = 0; i < AT->getNumElements(); ++i) {
-          findKernelArguments(AT->getElementType(), ArgumentTypeList);
-        }
-      } else if(PointerType * const PT = dyn_cast<PointerType>(T)) {
-        ArgumentTypeList.push_back(PointerType::get(cast<PointerType>(T)->getElementType(), ADDRESS_SPACE_GENERIC));
-      } else if(T->isSingleValueType()) {
-        ArgumentTypeList.push_back(T);
-      } else {
-        assert(false && "unsupported type in AMP kernel data");
-      }
-    }*/
-
     template<typename ListType> static void findKernelArguments(Type * const T, ListType &ArgumentTypeList) {
       if(StructType * const ST = dyn_cast<StructType>(T)) {
         for(unsigned i = 0; i < ST->getNumContainedTypes(); ++i) {
@@ -187,16 +175,13 @@ namespace {
           findKernelArguments(AT->getElementType(), ArgumentTypeList);
         }
       } else if(PointerType * const PT = dyn_cast<PointerType>(T)) {
-		ArgumentTypeList.push_back(PT);
-		//ArgumentTypeList.push_back(PointerType::get(cast<PointerType>(T)->getElementType(), ADDRESS_SPACE_GLOBAL));
-      } else if(T->isSingleValueType()) {
-        ArgumentTypeList.push_back(T);
-      } else {
+        if(PT->getAddressSpace() != 0) ArgumentTypeList.push_back(PT);
+      } else if(!T->isSingleValueType()) {
         assert(false && "unsupported type in AMP kernel data");
       }
     }
 
-    static void loadKernelArguments(Value * const P, Function::ArgumentListType::iterator &AI, BasicBlock * const BB) {
+    static void loadKernelArguments(Value * const P, Value * const C, Function::ArgumentListType::iterator &AI, BasicBlock * const BB) {
       Type * const T = cast<PointerType>(P->getType())->getElementType();
 
       if(StructType * const ST = dyn_cast<StructType>(T)) {
@@ -206,7 +191,7 @@ namespace {
 
         for(unsigned i = 0; i < ST->getNumContainedTypes(); ++i) {
           IdxList[1] = ConstantInt::get(IdxTy, i, false);
-          loadKernelArguments(GetElementPtrInst::Create(P, IdxList, "", BB), AI, BB);
+          loadKernelArguments(GetElementPtrInst::Create(P, IdxList, "", BB), GetElementPtrInst::Create(C, IdxList, "", BB), AI, BB);
         }
       } else if(ArrayType * const AT = dyn_cast<ArrayType>(T)) {
         IntegerType *IdxTy = IntegerType::get(P->getContext(), 32);
@@ -215,30 +200,17 @@ namespace {
 
         for(unsigned i = 0; i < AT->getNumElements(); ++i) {
           IdxList[1] = ConstantInt::get(IdxTy, i, false);
-          loadKernelArguments(GetElementPtrInst::Create(P, IdxList, "", BB), AI, BB);
+          loadKernelArguments(GetElementPtrInst::Create(P, IdxList, "", BB), GetElementPtrInst::Create(C, IdxList, "", BB), AI, BB);
         }
-      } else if(T->isPointerTy() || T->isSingleValueType()) {
-        new StoreInst(&*AI++, P, BB);
+      } else if(PointerType * const PT = dyn_cast<PointerType>(T)) {
+        if(PT->getAddressSpace() != 0) new StoreInst(&*AI++, P, BB);
+        else new StoreInst(ConstantPointerNull::get(PT), P, BB);
+      } else if(T->isSingleValueType()) {
+        new StoreInst(new LoadInst(C, "", BB), P, BB);
       } else {
         assert(false && "unsupported type in AMP kernel data");
       }
     }
-
-    /*template<typename ListType> void findIndices(Type * const T, ListType &IndexList) {
-      if(T->isSingleValueType()) {
-        IndexList.push_back(T);
-      } else if(StructType * const ST = dyn_cast<StructType>(T)) {
-        for(unsigned i = 0; i < ST->getNumContainedTypes(); ++i) {
-          findIndices(ST->getContainedType(i), IndexList);
-        }
-      } else if(ArrayType * const AT = dyn_cast<ArrayType>(T)) {
-        for(unsigned i = 0; i < AT->getNumElements(); ++i) {
-          findIndices(AT->getElementType(), IndexList);
-        }
-      } else {
-        assert(false && "unsupported type in AMP kernel indices");
-      }
-    }*/
 
     static void loadIndices(Value * const P, BasicBlock * const BB, Module * const M) {
       unsigned index = 0;
@@ -322,6 +294,7 @@ namespace {
         Type * const IndexType = IndexPointerType->getElementType();
 
         SmallVector<Type*, 8> Params;
+        Params.push_back(PointerType::get(KernelType, 2));
         findKernelArguments(KernelType, Params);
 
         Function * const KernelFunction = Function::Create(FunctionType::get(Type::getVoidTy(C), Params, false), GlobalValue::ExternalLinkage, TargetFunction->getName().str() + "_Kernel", &M);
@@ -330,7 +303,9 @@ namespace {
 
         AllocaInst * const DataObject = new AllocaInst(KernelType, "data", BB);
         Function::ArgumentListType::iterator AI = KernelFunction->arg_begin();
-        loadKernelArguments(DataObject, AI, BB);
+        Argument * const DataConst = &*AI++;
+        assert(cast<PointerType>(DataObject->getType())->getElementType() == cast<PointerType>(DataConst->getType())->getElementType());
+        loadKernelArguments(DataObject, DataConst, AI, BB);
         assert(AI == KernelFunction->arg_end());
 
         AllocaInst * const IndexObject = new AllocaInst(IndexType, "index", BB);
@@ -503,22 +478,170 @@ namespace {
       return modified;
     }
   };
+
+  class AMPCreateStubs : public ModulePass {
+
+  public:
+    static char ID;
+    AMPCreateStubs() : ModulePass(ID) {}
+
+    template<typename ListType> static void findKernelArguments(Type * const T, ListType &ArgumentTypeList) {
+      if(StructType * const ST = dyn_cast<StructType>(T)) {
+        for(unsigned i = 0; i < ST->getNumContainedTypes(); ++i) {
+          findKernelArguments(ST->getContainedType(i), ArgumentTypeList);
+        }
+      } else if(ArrayType * const AT = dyn_cast<ArrayType>(T)) {
+        for(unsigned i = 0; i < AT->getNumElements(); ++i) {
+          findKernelArguments(AT->getElementType(), ArgumentTypeList);
+        }
+      } else if(PointerType * const PT = dyn_cast<PointerType>(T)) {
+        if(PT->getAddressSpace() != 0) ArgumentTypeList.push_back(PT);
+      } else if(!T->isSingleValueType()) {
+        assert(false && "unsupported type in AMP kernel data");
+      }
+    }
+
+    static void loadKernelArguments(Value * const P, BasicBlock * const BB, Value * const A, unsigned &Count) {
+      Type * const T = cast<PointerType>(P->getType())->getElementType();
+
+      IntegerType *IdxTy = IntegerType::get(P->getContext(), 32);
+      Constant *IdxZero = ConstantInt::get(IdxTy, 0, false);
+      Value * IdxList[] = {IdxZero, IdxZero};
+
+      if(StructType * const ST = dyn_cast<StructType>(T)) {
+        //HACK: GROSS!
+        if(ST->getName().str() == "class.cl::Buffer") return;
+        for(unsigned i = 0; i < ST->getNumContainedTypes(); ++i) {
+          IdxList[1] = ConstantInt::get(IdxTy, i, false);
+          loadKernelArguments(GetElementPtrInst::Create(P, IdxList, "", BB), BB, A, Count);
+        }
+      } else if(ArrayType * const AT = dyn_cast<ArrayType>(T)) {
+        for(unsigned i = 0; i < AT->getNumElements(); ++i) {
+          IdxList[1] = ConstantInt::get(IdxTy, i, false);
+          loadKernelArguments(GetElementPtrInst::Create(P, IdxList, "", BB), BB, A, Count);
+        }
+      } else if(PointerType * const PT = dyn_cast<PointerType>(T)) {
+        //HACK: should be !=
+        if(PT->getAddressSpace() == 0) {
+          if(A) {
+            Value * IdxList2[] = { ConstantInt::get(IdxTy, Count, false) };
+            Value * const Target = GetElementPtrInst::Create(A, IdxList2, "", BB);
+            new StoreInst(new BitCastInst(P, cast<PointerType>(Target->getType())->getElementType(), "", BB), Target, BB);
+          }
+          ++Count;
+        }
+      } else if(T->isSingleValueType()) {
+      } else {
+        assert(false && "unsupported type in AMP kernel data");
+      }
+    }
+
+    bool runOnModule(Module &M) {
+      bool modified = false;
+
+      LLVMContext &C = M.getContext();
+
+      NamedMDNode * const Metadata = M.getNamedMetadata("amp.kernel");
+      if(!Metadata) return modified;
+
+      if(KernelFile.empty()) return modified;
+
+      std::ifstream KernelStream((KernelFile.c_str()));
+      if(!KernelStream.good()) return modified;
+
+      std::string KernelString((std::istreambuf_iterator<char>(KernelStream)), std::istreambuf_iterator<char>());
+
+      Constant * const CodeConstant = ConstantDataArray::getString(C, KernelString);
+      GlobalVariable * const CodeVariable = new GlobalVariable(M, CodeConstant->getType(), true, GlobalValue::PrivateLinkage, CodeConstant);
+      CodeVariable->setUnnamedAddr(true);
+      modified = true;
+
+      unsigned const Count = Metadata->getNumOperands();
+      for(unsigned i = 0; i < Count; ++i) {
+        MDNode * const Node = Metadata->getOperand(i);
+        assert(Node->getNumOperands() == 1);
+
+        if(Node->getNumOperands() < 1) continue;
+
+        Function * const TargetFunction = llvm::dyn_cast<Function>(Node->getOperand(0));
+        assert(TargetFunction->isDeclaration());
+        Type * const KernelType = cast<PointerType>(TargetFunction->getFunctionType()->getParamType(0))->getElementType();
+
+        Constant * const EntryConstant = ConstantDataArray::getString(C, TargetFunction->getName().str() + "_Kernel");
+        GlobalVariable * const EntryVariable = new GlobalVariable(M, EntryConstant->getType(), true, GlobalValue::PrivateLinkage, EntryConstant);
+        CodeVariable->setUnnamedAddr(true);
+
+        SmallVector<Type*, 8> Params;
+        Params.push_back(PointerType::get(KernelType, 0));
+        Params.push_back(PointerType::get(PointerType::get(Type::getInt8Ty(C), 0), 0));
+
+        Function * const GetBuffersFunction = Function::Create(FunctionType::get(Type::getVoidTy(C), Params, false), GlobalValue::PrivateLinkage, TargetFunction->getName().str() + "_GetBuffers", &M);
+
+        BasicBlock * const BB = BasicBlock::Create(C, "entry", GetBuffersFunction);
+
+        Function::ArgumentListType::iterator AI = GetBuffersFunction->arg_begin();
+        Argument * const DataArg = &*AI++;
+        Argument * const BufferArg = &*AI++;
+
+        unsigned BufferCount = 0;
+        loadKernelArguments(DataArg, BB, BufferArg, BufferCount);
+
+        ReturnInst::Create(C, BB);
+
+        IntegerType *IdxTy = IntegerType::get(M.getContext(), 32);
+        Constant *IdxZero = ConstantInt::get(IdxTy, 0, false);
+        Constant * const IdxList[] = {IdxZero, IdxZero};
+
+        StructType * const KernelInfoStruct = StructType::get(
+          Type::getInt8PtrTy(C),
+          Type::getInt8PtrTy(C),
+          Type::getInt32Ty(C),
+          GetBuffersFunction->getType(),
+          NULL);
+
+        Constant * const KernelInfoConstant = ConstantStruct::get(KernelInfoStruct,
+          ConstantExpr::getInBoundsGetElementPtr(CodeVariable, IdxList),
+          ConstantExpr::getInBoundsGetElementPtr(EntryVariable, IdxList),
+          ConstantInt::get(Type::getInt32Ty(C), BufferCount),
+          GetBuffersFunction,
+          NULL);
+
+        GlobalVariable * const KernelInfoVariable = new GlobalVariable(M, KernelInfoConstant->getType(), true, GlobalValue::PrivateLinkage, KernelInfoConstant);
+        CodeVariable->setUnnamedAddr(true);
+
+        Function * const StubFunction = Function::Create(FunctionType::get(PointerType::get(KernelInfoStruct, 0), false), GlobalValue::PrivateLinkage, TargetFunction->getName() + "_STUB", &M);
+        IRBuilder<> B(BasicBlock::Create(C, "entry", StubFunction));
+        B.CreateRet(ConstantExpr::getInBoundsGetElementPtr(KernelInfoVariable, IdxZero));
+
+        TargetFunction->replaceAllUsesWith(ConstantExpr::getBitCast(StubFunction, TargetFunction->getType()));
+      }
+
+      Metadata->eraseFromParent();
+      modified = true;
+
+      return modified;
+    }
+  };
 }
 
 namespace llvm {
   void initializeAMPToOpenCLPass(PassRegistry&);
   void initializeStripAMPPass(PassRegistry&);
+  void initializeAMPCreateStubsPass(PassRegistry&);
 
   void initializeAMP(PassRegistry& R) {
     initializeAMPToOpenCLPass(R);
     initializeStripAMPPass(R);
+    initializeAMPCreateStubsPass(R);
   }
 }
 
 char AMPToOpenCL::ID = 0;
 char StripAMP::ID = 0;
+char AMPCreateStubs::ID = 0;
 INITIALIZE_PASS(AMPToOpenCL, "amp-to-opencl", "Generate OpenCL kernels for AMP", false, false)
 INITIALIZE_PASS(StripAMP, "strip-amp", "Strip AMP functions", false, false)
+INITIALIZE_PASS(AMPCreateStubs, "amp-create-stubs", "Create stubs for AMP kernels", false, false)
 
 Pass *llvm::createAMPToOpenCLPass() {
   return new AMPToOpenCL();
